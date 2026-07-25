@@ -20,7 +20,13 @@ cd aside-antigravity-proxy
 ./install.sh
 ```
 
-That checks your Antigravity login, finds a free port, registers a launchd agent so the proxy comes back after a reboot, and adds an **Antigravity** provider to Aside's `models.json`.
+### What it does
+
+1. Checks that you're logged into the Antigravity CLI.
+2. Picks a free port.
+3. Registers a launchd agent, so the proxy comes back after a reboot.
+4. Probes which Antigravity models answer and registers the ones that do.
+5. Adds an **Antigravity** provider to Aside's `models.json`.
 
 Restart Aside afterwards. It reads `models.json` at startup, so a running app won't notice the new provider until then.
 
