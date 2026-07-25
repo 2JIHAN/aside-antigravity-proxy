@@ -11,6 +11,8 @@ from auth import TokenManager
 from models import get_models, get_default_model
 from translator import anthropic_to_antigravity, process_antigravity_stream
 
+__version__ = '1.0.1'
+
 ANTIGRAVITY_ENDPOINT = os.environ.get(
     'ANTIGRAVITY_ENDPOINT',
     'https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse'
@@ -44,7 +46,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_cors_headers()
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps({'status': 'ok', 'proxy': 'aside-antigravity-proxy'}).encode('utf-8'))
+            self.wfile.write(json.dumps({'status': 'ok', 'proxy': 'aside-antigravity-proxy', 'version': __version__}).encode('utf-8'))
         elif self.path in ('/v1/models', '/models'):
             self.send_response(200)
             self._send_cors_headers()

@@ -65,7 +65,7 @@ It reprobes, updates Aside's config, and prints what came and went.
 
 ## Credentials
 
-Nothing secret lives in this repository. The proxy reads your OAuth token from the Antigravity CLI's own file at request time, and reads the client secret out of the installed `agy` binary. It borrows the CLI's login, so it borrows the CLI's identity too. Set `ANTIGRAVITY_CLIENT_SECRET` if you'd rather supply it yourself.
+Nothing secret lives in this repository. The proxy reads your OAuth token from wherever the Antigravity CLI keeps it — its own token file on older versions, the login keychain from 1.1.7 on — and reads the client secret out of the installed `agy` binary. It borrows the CLI's login, so it borrows the CLI's identity too. Set `ANTIGRAVITY_CLIENT_SECRET` if you'd rather supply it yourself.
 
 ## Known limits
 

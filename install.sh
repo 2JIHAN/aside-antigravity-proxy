@@ -53,8 +53,7 @@ EOF
 if check_oauth; then
     echo "  - OAuth token is valid."
 else
-    echo "  - Antigravity OAuth token not found or invalid at:"
-    echo "      $TOKEN_PATH"
+    echo "  - No valid Antigravity login found (checked the token file and the login keychain)."
     echo ""
     echo "  This proxy reuses the login created by the Antigravity CLI (agy)."
     echo "  To authenticate:"

@@ -1,7 +1,9 @@
+import base64
 import json
 import os
 import re
 import shutil
+import subprocess
 import time
 import urllib.request
 import urllib.parse
@@ -73,19 +75,57 @@ class TokenManager:
         self._refresh_token: Optional[str] = None
         self._expires_at: float = 0.0
 
-    def _load_from_file(self):
+    def _read_token_file(self) -> Optional[dict]:
         if not os.path.exists(self.token_path):
-            raise FileNotFoundError(f"OAuth token file not found at {self.token_path}")
-        with open(self.token_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+            return None
+        try:
+            with open(self.token_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _read_keychain(self) -> Optional[dict]:
+        """agy 1.1.7 stopped writing the token file and uses the login keychain.
+
+        The stored value is go-keyring's base64 form, not raw JSON.
+        """
+        try:
+            res = subprocess.run(
+                ['security', 'find-generic-password', '-s', 'gemini', '-a', 'antigravity', '-w'],
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception:
+            return None
+        if res.returncode != 0:
+            return None
+
+        raw = res.stdout.strip()
+        prefix = 'go-keyring-base64:'
+        if raw.startswith(prefix):
+            try:
+                raw = base64.b64decode(raw[len(prefix):]).decode('utf-8')
+            except Exception:
+                return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+
+    def _load_credentials(self):
+        data = self._read_token_file() or self._read_keychain()
+        if data is None:
+            raise FileNotFoundError(
+                f"No Antigravity credentials found (looked in {self.token_path} and the login keychain). "
+                "Run 'agy' once and complete the browser login."
+            )
         tok = data.get('token', {})
         self._access_token = tok.get('access_token')
         self._refresh_token = tok.get('refresh_token')
 
     def refresh(self) -> str:
-        self._load_from_file()
+        self._load_credentials()
         if not self._refresh_token:
-            raise ValueError("No refresh token available in antigravity-oauth-token")
+            raise ValueError("Antigravity credentials have no refresh token; run 'agy' and log in again")
 
         params = {
             'client_id': CLIENT_ID,
