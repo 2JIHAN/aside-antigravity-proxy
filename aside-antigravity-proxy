@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""Launcher so macOS shows a meaningful name.
+
+launchd/Login Items label the agent by its executable filename. Pointing the
+plist at `python3` made it appear in System Settings > Login Items as a bare
+"python3" from an unidentified developer, which reads as something suspicious.
+Running the server through this file makes it show up as
+"aside-antigravity-proxy" instead.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in ('--refresh-models', '-r'):
+        from refresh_models import run_refresh
+        success = run_refresh()
+        sys.exit(0 if success else 1)
+
+    from server import DEFAULT_PORT, run_server  # noqa: E402
+    port = DEFAULT_PORT
+    if len(sys.argv) > 1:
+        try:
+            port = int(sys.argv[1])
+        except ValueError:
+            pass
+    run_server(port)

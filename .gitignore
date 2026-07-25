@@ -1,0 +1,9 @@
+*.log
+proxy.log
+proxy.err.log
+*.secret
+.secret
+__pycache__/
+.DS_Store
+.models-cache.json
+.models-cache.json.tmp
