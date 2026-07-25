@@ -30,6 +30,16 @@ cd aside-antigravity-proxy
 
 Restart Aside afterwards. It reads `models.json` at startup, so a running app won't notice the new provider until then.
 
+## Update
+
+```bash
+./update.sh
+```
+
+Pulls the latest code, runs any one-time migrations you skipped, and reinstalls. It stops if you have local changes rather than clobbering them, and it's fine to jump several versions at once — migrations run in order from wherever you are.
+
+Restart Aside afterwards if the model list changed.
+
 ## Use it
 
 In the app, open **Settings → AI → Providers**. *Antigravity* is listed there, and its models appear in the model picker next to your other ones.

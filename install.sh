@@ -201,6 +201,9 @@ else
     echo "  Please check ${DIR}/proxy.err.log for details."
 fi
 
+# Record what's installed so update.sh knows which migrations to run.
+cat "$DIR/VERSION" > "$DIR/.installed-version" 2>/dev/null || true
+
 echo ""
 echo "=== Setup Completed ==="
 echo ""

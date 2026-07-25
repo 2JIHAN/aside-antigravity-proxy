@@ -7,3 +7,4 @@ __pycache__/
 .DS_Store
 .models-cache.json
 .models-cache.json.tmp
+.installed-version

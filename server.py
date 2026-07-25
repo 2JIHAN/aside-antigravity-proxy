@@ -11,7 +11,15 @@ from auth import TokenManager
 from models import get_models, get_default_model
 from translator import anthropic_to_antigravity, process_antigravity_stream
 
-__version__ = '1.0.1'
+def _read_version() -> str:
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'VERSION')) as f:
+            return f.read().strip()
+    except Exception:
+        return 'unknown'
+
+
+__version__ = _read_version()
 
 ANTIGRAVITY_ENDPOINT = os.environ.get(
     'ANTIGRAVITY_ENDPOINT',
