@@ -15,7 +15,7 @@ Tool calls work, which is the part that matters. Aside's agent runs on tools. Sk
 ## Install
 
 ```bash
-git clone https://github.com/<you>/aside-antigravity-proxy.git
+git clone https://github.com/2JIHAN/aside-antigravity-proxy.git
 cd aside-antigravity-proxy
 ./install.sh
 ```
