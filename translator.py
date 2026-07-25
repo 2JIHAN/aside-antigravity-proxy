@@ -7,6 +7,50 @@ from models import get_default_model, get_models
 THOUGHT_SIGNATURE_CACHE: Dict[str, str] = {}
 
 
+def _collapse_any_of(branches: List[Any]) -> Dict[str, Any]:
+    """Fold an `anyOf` union down to a single schema.
+
+    Gemini's schema dialect has no `anyOf`, and the gateway does not just ignore
+    it: for the Claude models it round-trips the declaration back into an
+    Anthropic tool and emits an `input_schema` the API rejects outright with
+    "must match JSON Schema draft 2020-12". Every tool in the request dies with
+    it, so one union in one parameter takes down the whole turn. `oneOf`,
+    `allOf` and `not` survive the round-trip untouched — it is `anyOf`
+    specifically.
+
+    A union of literals is what the union nearly always is in practice (it is
+    what `z.enum()` and friends compile to), and that folds exactly onto an
+    enum. Anything richer falls back to the first branch, which keeps the
+    parameter usable rather than dropping it.
+    """
+    subs = [b for b in branches if isinstance(b, dict)]
+    if not subs:
+        return {}
+
+    # `.optional()` shows up as a bare null branch beside the real one.
+    non_null = [b for b in subs if b.get('type') != 'null']
+    nullable = len(non_null) != len(subs)
+    if not non_null:
+        return {'type': 'string', 'nullable': True}
+
+    types = {b.get('type') for b in non_null}
+    if len(types) == 1 and all(isinstance(b.get('enum'), list) for b in non_null):
+        values: List[Any] = []
+        for b in non_null:
+            for val in b['enum']:
+                if val not in values:
+                    values.append(val)
+        merged: Dict[str, Any] = {'enum': values}
+        if non_null[0].get('type'):
+            merged['type'] = non_null[0]['type']
+    else:
+        merged = dict(non_null[0])
+
+    if nullable:
+        merged['nullable'] = True
+    return merged
+
+
 def sanitize_schema(schema: Any) -> Any:
     # ponytail: strip/convert JSON schema keys not supported by Gemini parameters, handles deep recursion
     if not isinstance(schema, dict):
@@ -26,8 +70,12 @@ def sanitize_schema(schema: Any) -> Any:
     name_keyed = {'properties', 'patternProperties', '$defs', 'definitions'}
 
     cleaned: Dict[str, Any] = {}
+    pending_any_of: Optional[List[Any]] = None
     for k, v in schema.items():
         if k in disallowed_keys:
+            continue
+        if k == 'anyOf' and isinstance(v, list):
+            pending_any_of = [sanitize_schema(x) for x in v]
             continue
         if k == 'const':
             cleaned['enum'] = [v]
@@ -46,6 +94,12 @@ def sanitize_schema(schema: Any) -> Any:
             cleaned[k] = [sanitize_schema(x) for x in v]
         else:
             cleaned[k] = v
+
+    if pending_any_of is not None:
+        # Sibling keys were written by the tool author about the union as a
+        # whole, so they outrank anything the branches carry.
+        for k, v in _collapse_any_of(pending_any_of).items():
+            cleaned.setdefault(k, v)
 
     if 'required' in cleaned and isinstance(cleaned['required'], list):
         props = cleaned.get('properties', {})
