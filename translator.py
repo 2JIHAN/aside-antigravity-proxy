@@ -1,10 +1,123 @@
+import base64
 import json
+import sys
 import uuid
 from typing import Dict, Any, Generator, Tuple, Union, List, Optional
 
 from models import get_default_model, get_models
 
 THOUGHT_SIGNATURE_CACHE: Dict[str, str] = {}
+
+# Gemini returns STOP even when it stopped for a reason worth reporting, so the
+# absent case and the ordinary case both land on end_turn.
+_FINISH_REASON_TO_STOP_REASON = {
+    'MAX_TOKENS': 'max_tokens',
+}
+
+
+def _log(message: str) -> None:
+    sys.stderr.write(f"[translator] {message}\n")
+
+
+def _recover_thought_signature(tool_id: str) -> Optional[str]:
+    """Recover a thoughtSignature for a tool_use id coming back from the client.
+
+    The cache is authoritative. Older ids carry the signature in their own tail
+    (see `make_tool_id`), and those are still in saved sessions, so the tail is
+    kept as a fallback — but only when it decodes. A tail that arrives truncated
+    re-pads to something no decoder accepts, and the gateway answers the whole
+    request with `Invalid value at ... thought_signature (TYPE_BYTES), Base64
+    decoding failed`, which kills the turn. Dropping the signature only costs
+    the model its reasoning continuity for that one call, so an unusable tail is
+    worth strictly less than no tail at all.
+    """
+    cached = THOUGHT_SIGNATURE_CACHE.get(tool_id)
+    if cached:
+        return cached
+
+    if not tool_id.startswith('toolu_'):
+        return None
+    segments = tool_id.split('_', 2)
+    if len(segments) != 3 or not segments[2]:
+        return None
+
+    raw_sig = segments[2].replace('-', '+').replace('_', '/')
+    remainder = len(raw_sig) % 4
+    if remainder == 1:
+        # No base64 string is ever 1 mod 4 — this tail lost characters in transit.
+        _log(f"dropping truncated thoughtSignature from tool id (tail {len(raw_sig)} chars)")
+        return None
+    if remainder:
+        raw_sig += '=' * (4 - remainder)
+
+    try:
+        base64.b64decode(raw_sig, validate=True)
+    except Exception:
+        _log("dropping undecodable thoughtSignature from tool id")
+        return None
+    return raw_sig
+
+
+def _stringify_tool_result(res_content: Any) -> str:
+    if isinstance(res_content, str):
+        return res_content
+    if isinstance(res_content, list):
+        collected = []
+        for sub in res_content:
+            if isinstance(sub, dict) and sub.get('type') == 'text':
+                collected.append(sub.get('text', ''))
+            elif isinstance(sub, str):
+                collected.append(sub)
+        return "\n".join(collected)
+    if res_content is None:
+        return ""
+    try:
+        return json.dumps(res_content, ensure_ascii=False)
+    except Exception:
+        return str(res_content)
+
+
+def _describe_unsigned_call(name: str, args: Any) -> str:
+    try:
+        rendered = json.dumps(args, ensure_ascii=False)
+    except Exception:
+        rendered = str(args)
+    if len(rendered) > 2000:
+        rendered = rendered[:2000] + '…'
+    return f"[earlier tool call] {name or 'unknown tool'}({rendered})"
+
+
+def _describe_unsigned_result(name: str, res_content: Any, is_error: bool) -> str:
+    body = _stringify_tool_result(res_content)
+    if len(body) > 8000:
+        body = body[:8000] + '…'
+    label = 'failed' if is_error else 'returned'
+    return f"[earlier tool result] {name or 'unknown tool'} {label}: {body}"
+
+
+def _stop_reason_for(finish_reason: Optional[str], has_tool_use: bool) -> str:
+    mapped = _FINISH_REASON_TO_STOP_REASON.get(finish_reason or '')
+    if mapped:
+        return mapped
+    return 'tool_use' if has_tool_use else 'end_turn'
+
+
+def _empty_content_notice(finish_reason: Optional[str]) -> str:
+    """Text to stand in for a reply that arrived with nothing in it.
+
+    Returning an empty string here is indistinguishable, from the user's side,
+    from the agent ignoring them: the turn ends, the transcript records an
+    assistant message, and the chat shows nothing at all. Say what happened
+    instead.
+    """
+    if finish_reason == 'MAX_TOKENS':
+        return ("[proxy] The model hit its output limit before writing any reply. "
+                "Raise max_tokens or shorten the conversation, then try again.")
+    if finish_reason in ('SAFETY', 'RECITATION', 'PROHIBITED_CONTENT', 'BLOCKLIST', 'SPII', 'IMAGE_SAFETY'):
+        return f"[proxy] The model stopped without replying (finishReason: {finish_reason})."
+    if finish_reason:
+        return f"[proxy] The model returned no content (finishReason: {finish_reason})."
+    return "[proxy] The model returned no content and gave no reason."
 
 
 def _collapse_any_of(branches: List[Any]) -> Dict[str, Any]:
@@ -161,6 +274,7 @@ def anthropic_to_antigravity(anthropic_req: Dict[str, Any]) -> Dict[str, Any]:
     contents: List[Dict[str, Any]] = []
     messages = anthropic_req.get('messages', [])
     tool_id_to_name: Dict[str, str] = {}
+    unsigned_tool_ids: set = set()
 
     for msg in messages:
         role = msg.get('role', 'user')
@@ -196,27 +310,26 @@ def anthropic_to_antigravity(anthropic_req: Dict[str, Any]) -> Dict[str, Any]:
                             tool_id_to_name[t_id] = t_name
 
                         # ponytail: extract thoughtSignature required by Gemini 3.5/3.6 for multi-turn function calls
-                        t_sig = THOUGHT_SIGNATURE_CACHE.get(t_id)
-                        if not t_sig and t_id.startswith('toolu_') and '_' in t_id:
-                            try:
-                                parts_id = t_id.split('_', 2)
-                                if len(parts_id) == 3:
-                                    raw_sig = parts_id[2].replace('-', '+').replace('_', '/')
-                                    pad = len(raw_sig) % 4
-                                    if pad:
-                                        raw_sig += '=' * (4 - pad)
-                                    t_sig = raw_sig
-                            except Exception:
-                                pass
+                        t_sig = _recover_thought_signature(t_id)
+
+                        if not t_sig:
+                            # The gateway rejects a functionCall with no signature just
+                            # as hard as one with a broken signature: "Function call is
+                            # missing a thought_signature ... required for tools to work
+                            # correctly". Either way the turn dies. Replaying the call as
+                            # narration keeps the history honest about what happened while
+                            # leaving no functionCall part for it to object to.
+                            unsigned_tool_ids.add(t_id)
+                            parts.append({'text': _describe_unsigned_call(t_name, t_input)})
+                            continue
 
                         fc_part: Dict[str, Any] = {
                             'functionCall': {
                                 'name': t_name,
                                 'args': t_input if isinstance(t_input, dict) else {}
-                            }
+                            },
+                            'thoughtSignature': t_sig,
                         }
-                        if t_sig:
-                            fc_part['thoughtSignature'] = t_sig
                         parts.append(fc_part)
 
                     elif b_type == 'tool_result':
@@ -224,6 +337,12 @@ def anthropic_to_antigravity(anthropic_req: Dict[str, Any]) -> Dict[str, Any]:
                         t_name = tool_id_to_name.get(t_use_id, '')
                         res_content = block.get('content', '')
                         is_error = block.get('is_error', False)
+
+                        if t_use_id in unsigned_tool_ids:
+                            # Its functionCall became narration above, and a
+                            # functionResponse with nothing to answer is its own error.
+                            parts.append({'text': _describe_unsigned_result(t_name, res_content, is_error)})
+                            continue
 
                         if is_error:
                             if isinstance(res_content, str):
@@ -307,14 +426,25 @@ def anthropic_to_antigravity(anthropic_req: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def make_tool_id(thought_sig: Optional[str] = None) -> str:
-    # ponytail: generate tool_use id and optionally encode thoughtSignature for stateless recovery
-    short_uuid = uuid.uuid4().hex[:8]
+    """Mint a tool_use id, keeping any thoughtSignature in the cache beside it.
+
+    The signature used to be packed into the id itself so it could survive a
+    proxy restart. It does not survive the trip: something between here and the
+    next request caps the id at 64 characters, and every signature we have seen
+    is far longer than the 49 characters that leaves. What came back was a
+    truncated tail that no longer decoded, and the gateway rejected the entire
+    request rather than the one signature — which is how a lost signature turned
+    into a dead turn.
+
+    A short id always fits under the cap, so the id survives and the cache
+    answers for it. The cost is that a proxy restart drops the signatures it was
+    holding; those calls lose reasoning continuity, which is the same price the
+    truncated ones already paid, without taking the turn down with them.
+    """
+    tool_id = f"toolu_{uuid.uuid4().hex[:24]}"
     if thought_sig:
-        encoded_sig = thought_sig.replace('+', '-').replace('/', '_').rstrip('=')
-        tool_id = f"toolu_{short_uuid}_{encoded_sig}"
         THOUGHT_SIGNATURE_CACHE[tool_id] = thought_sig
-        return tool_id
-    return f"toolu_{short_uuid}{uuid.uuid4().hex[:16]}"
+    return tool_id
 
 
 def process_antigravity_stream(
@@ -349,6 +479,8 @@ def _stream_generator(response_stream, msg_id: str, model: str) -> Generator[str
     current_index = 0
     active_block_type = None
     has_tool_use = False
+    emitted_any_block = False
+    finish_reason = None
     input_tokens = 0
     output_tokens = 0
 
@@ -370,6 +502,8 @@ def _stream_generator(response_stream, msg_id: str, model: str) -> Generator[str
 
             candidates = resp.get('candidates', [])
             for cand in candidates:
+                if cand.get('finishReason'):
+                    finish_reason = cand['finishReason']
                 content = cand.get('content', {})
                 parts = content.get('parts', [])
                 for part in parts:
@@ -386,6 +520,7 @@ def _stream_generator(response_stream, msg_id: str, model: str) -> Generator[str
                             }
                             yield f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n"
                             active_block_type = 'text'
+                            emitted_any_block = True
 
                         delta_event = {
                             "type": "content_block_delta",
@@ -431,15 +566,28 @@ def _stream_generator(response_stream, msg_id: str, model: str) -> Generator[str
                         yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_index})}\n\n"
                         current_index += 1
                         has_tool_use = True
+                        emitted_any_block = True
                         active_block_type = None
 
-        except Exception:
-            pass
+        except Exception as exc:
+            # Swallowing this silently drops whatever the chunk carried and
+            # leaves no trace of why the reply came up short.
+            _log(f"discarded a malformed stream chunk: {exc.__class__.__name__}: {exc}")
 
     if active_block_type is not None:
         yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_index})}\n\n"
+        current_index += 1
 
-    stop_reason = "tool_use" if has_tool_use else "end_turn"
+    if not emitted_any_block:
+        notice = _empty_content_notice(finish_reason)
+        _log(f"stream produced no content blocks (finishReason: {finish_reason}) — sending notice instead")
+        yield ("event: content_block_start\ndata: "
+               f"{json.dumps({'type': 'content_block_start', 'index': current_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n")
+        yield ("event: content_block_delta\ndata: "
+               f"{json.dumps({'type': 'content_block_delta', 'index': current_index, 'delta': {'type': 'text_delta', 'text': notice}})}\n\n")
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_index})}\n\n"
+
+    stop_reason = _stop_reason_for(finish_reason, has_tool_use)
     msg_delta_event = {
         "type": "message_delta",
         "delta": {"stop_reason": stop_reason, "stop_sequence": None},
@@ -455,6 +603,7 @@ def _non_stream_response(response_stream, msg_id: str, model: str) -> Dict[str, 
     content_blocks: List[Dict[str, Any]] = []
     current_text = ""
     has_tool_use = False
+    finish_reason = None
     input_tokens = 0
     output_tokens = 0
 
@@ -476,6 +625,8 @@ def _non_stream_response(response_stream, msg_id: str, model: str) -> Dict[str, 
 
             candidates = resp.get('candidates', [])
             for cand in candidates:
+                if cand.get('finishReason'):
+                    finish_reason = cand['finishReason']
                 content = cand.get('content', {})
                 parts = content.get('parts', [])
                 for part in parts:
@@ -496,16 +647,17 @@ def _non_stream_response(response_stream, msg_id: str, model: str) -> Dict[str, 
                             "input": func_call.get('args', {})
                         })
                         has_tool_use = True
-        except Exception:
-            pass
+        except Exception as exc:
+            _log(f"discarded a malformed response chunk: {exc.__class__.__name__}: {exc}")
 
     if current_text:
         content_blocks.append({"type": "text", "text": current_text})
 
     if not content_blocks:
-        content_blocks.append({"type": "text", "text": ""})
+        _log(f"response had no content blocks (finishReason: {finish_reason}) — sending notice instead")
+        content_blocks.append({"type": "text", "text": _empty_content_notice(finish_reason)})
 
-    stop_reason = "tool_use" if has_tool_use else "end_turn"
+    stop_reason = _stop_reason_for(finish_reason, has_tool_use)
 
     return {
         "id": msg_id,
