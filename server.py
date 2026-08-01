@@ -104,13 +104,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
         requested_model = ag_payload.get('model', get_default_model())
 
         # Obtain OAuth token and make request to Antigravity
-        resp_stream = self._call_antigravity(ag_payload)
+        resp_stream, failure = self._call_antigravity(ag_payload)
         if resp_stream is None:
-            self.send_response(502)
+            status, message = failure or (502, 'Failed to reach Antigravity gateway')
+            # Reporting an upstream 400 as a 502 tells the client the gateway is
+            # down when it is actually answering, and answering with the reason.
+            # The client then retries an unchanged request that cannot succeed,
+            # and the real complaint never reaches anyone who can read it.
+            err_type = 'invalid_request_error' if 400 <= status < 500 else 'api_error'
+            self.send_response(status)
             self._send_cors_headers()
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps({'error': {'type': 'api_error', 'message': 'Failed to reach Antigravity gateway'}}).encode('utf-8'))
+            self.wfile.write(json.dumps({'error': {'type': err_type, 'message': message}}).encode('utf-8'))
             return
 
         if is_stream:
@@ -144,6 +150,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(res_bytes)
 
     def _call_antigravity(self, ag_payload: Dict[str, Any], retry_auth: bool = True):
+        """Returns (stream, None) on success, or (None, (status, message)) on failure."""
         token = token_manager.get_access_token()
         headers = {
             'Authorization': f'Bearer {token}',
@@ -154,18 +161,43 @@ class ProxyHandler(BaseHTTPRequestHandler):
         req = urllib.request.Request(ANTIGRAVITY_ENDPOINT, data=data, headers=headers, method='POST')
 
         try:
-            return urllib.request.urlopen(req)
+            return urllib.request.urlopen(req), None
         except urllib.error.HTTPError as e:
             if e.code == 401 and retry_auth:
                 sys.stderr.write("[Auth] Received 401 from Antigravity, refreshing token...\n")
                 token_manager.get_access_token(force_refresh=True)
                 return self._call_antigravity(ag_payload, retry_auth=False)
-            else:
-                sys.stderr.write(f"[Error] Antigravity gateway error {e.code}: {e.read().decode('utf-8', errors='ignore')}\n")
-                return None
+            body = e.read().decode('utf-8', errors='ignore')
+            sys.stderr.write(f"[Error] Antigravity gateway error {e.code}: {body}\n")
+            return None, (e.code, self._describe_upstream_error(e.code, body))
         except Exception as ex:
             sys.stderr.write(f"[Error] Network error talking to Antigravity: {ex}\n")
-            return None
+            return None, (502, f'Failed to reach Antigravity gateway: {ex}')
+
+    @staticmethod
+    def _describe_upstream_error(status: int, body: str) -> str:
+        """Pull the gateway's own explanation out of its error envelope."""
+        try:
+            err = json.loads(body).get('error', {})
+        except Exception:
+            err = {}
+        message = err.get('message') or body.strip() or 'no detail'
+
+        # The useful part of an INVALID_ARGUMENT is the per-field list; the
+        # top-level message is only ever "Request contains an invalid argument."
+        fields = []
+        for detail in err.get('details') or []:
+            for violation in detail.get('fieldViolations') or []:
+                desc = violation.get('description') or ''
+                field = violation.get('field') or ''
+                fields.append(f"{field}: {desc}" if field else desc)
+        if fields:
+            shown = '; '.join(fields[:3])
+            if len(fields) > 3:
+                shown += f" (+{len(fields) - 3} more)"
+            message = f"{message} [{shown}]"
+
+        return f"Antigravity gateway rejected the request ({status}): {message[:1500]}"
 
 
 def run_server(port: int = DEFAULT_PORT):
