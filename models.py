@@ -116,10 +116,16 @@ def get_candidates() -> List[str]:
             # `agy models` takes ~3s on a warm start; leave real headroom.
             res = subprocess.run([agy_bin, 'models'], capture_output=True, text=True, timeout=30)
             if res.returncode == 0 and res.stdout.strip():
+                # `agy models` prints "<id>\t<display name>". Taking the whole line sends
+                # "gemini-3.6-flash-high\tGemini 3.6 Flash (High)" as the model id and the
+                # gateway answers 404 for every candidate — the refresh then keeps the stale
+                # cache and looks like the models vanished (2026-08-14). Keep the first field
+                # only; a plain id with no tab survives this untouched.
                 lines = [
-                    line.strip() for line in res.stdout.splitlines()
+                    line.split('\t')[0].strip() for line in res.stdout.splitlines()
                     if line.strip() and not line.startswith('#')
                 ]
+                lines = [mid for mid in lines if mid and ' ' not in mid]
                 if lines:
                     return lines
         except Exception:
