@@ -140,8 +140,13 @@ def get_candidates() -> List[str]:
                 candidates.append(m["id"])
     return candidates
 
-def probe_model(model_id: str) -> Tuple[bool, int, str]:
-    """Probe gateway with a minimal prompt to verify model availability and text response."""
+def probe_model(model_id: str, token: Optional[str] = None) -> Tuple[bool, int, str]:
+    """Probe gateway with a minimal prompt to verify model availability and text response.
+
+    Pass `token` to reuse one access token across a sweep. Without it every probe
+    builds a fresh TokenManager, and a fresh manager holds no token — so it spends
+    a full OAuth round-trip before it can ask about a single model.
+    """
     from auth import TokenManager
     from translator import anthropic_to_antigravity
 
@@ -153,10 +158,11 @@ def probe_model(model_id: str) -> Tuple[bool, int, str]:
     ag_payload = anthropic_to_antigravity(anthropic_req)
     ag_payload['model'] = model_id
 
-    try:
-        token = TokenManager().get_access_token()
-    except Exception as e:
-        return (False, 0, f"Token error: {e}")
+    if token is None:
+        try:
+            token = TokenManager().get_access_token()
+        except Exception as e:
+            return (False, 0, f"Token error: {e}")
 
     headers = {
         'Authorization': f'Bearer {token}',
@@ -201,12 +207,28 @@ def probe_model(model_id: str) -> Tuple[bool, int, str]:
 
 def discover_models(progress_callback: Optional[Any] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Tuple[bool, int, str]]]:
     """Probe candidate models in parallel (max 3 workers) and return verified models and detail results."""
+    from auth import TokenManager
+
     candidates = get_candidates()
     results: Dict[str, Tuple[bool, int, str]] = {}
     verified_models: List[Dict[str, Any]] = []
 
+    # One token for the whole sweep. It outlives the sweep by an hour, and minting
+    # one per candidate hammered Google's token endpoint once per model for no gain.
+    try:
+        token = TokenManager().get_access_token()
+    except Exception as e:
+        # Nothing below can succeed; report it per candidate so the output still
+        # names them, but without pointless network calls.
+        failure = (False, 0, f"Token error: {e}")
+        for mid in candidates:
+            results[mid] = failure
+            if progress_callback:
+                progress_callback(mid, failure)
+        return [], results
+
     def _worker(model_id: str):
-        res = probe_model(model_id)
+        res = probe_model(model_id, token=token)
         if progress_callback:
             progress_callback(model_id, res)
         return (model_id, res)

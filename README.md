@@ -75,7 +75,7 @@ launchctl bootout gui/$(id -u)/io.local.aside-antigravity-proxy.refresh
 | | |
 |---|---|
 | Different port | `./install.sh 9000` — the installer also moves off a port that's taken |
-| Logs | `proxy.log`, `proxy.err.log`, `refresh.log` in this directory |
+| Logs | `proxy.log`, `proxy.err.log`, `refresh.log` in this directory — trimmed to the last 2000 lines by the daily job, or by `./rotate-logs.sh` (`KEEP_LINES=500 ./rotate-logs.sh` to keep fewer) |
 | Refresh schedule | daily at 10:00, launchd agent `io.local.aside-antigravity-proxy.refresh` |
 | Health check | `curl http://127.0.0.1:8317/health` |
 | Uninstall | `./uninstall.sh` — removes both launchd agents and the Aside provider entry, leaves your Antigravity login alone |

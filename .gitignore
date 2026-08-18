@@ -8,3 +8,4 @@ __pycache__/
 .models-cache.json
 .models-cache.json.tmp
 .installed-version
+*.trim

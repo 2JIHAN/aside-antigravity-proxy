@@ -33,12 +33,26 @@ def _secret_from_agy() -> Optional[str]:
     agy = _find_agy()
     if not agy:
         return None
+    # Google client secrets are GOCSPX- plus exactly 28 characters. An
+    # open-ended match runs straight into whatever the binary stores next.
+    pattern = re.compile(rb'GOCSPX-[A-Za-z0-9_-]{28}')
+    # agy is ~170MB. Reading it whole to run one regex spikes this process by that
+    # much, and the proxy is long-lived. Scan in chunks, keeping an overlap wider
+    # than the pattern so a secret straddling a boundary is still found.
+    chunk_size = 1 << 20
+    overlap = 64
     try:
         with open(agy, 'rb') as f:
-            # Google client secrets are GOCSPX- plus exactly 28 characters. An
-            # open-ended match runs straight into whatever the binary stores next.
-            match = re.search(rb'GOCSPX-[A-Za-z0-9_-]{28}', f.read())
-        return match.group().decode() if match else None
+            tail = b''
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    return None
+                buf = tail + chunk
+                match = pattern.search(buf)
+                if match:
+                    return match.group().decode()
+                tail = buf[-overlap:]
     except Exception:
         return None
 

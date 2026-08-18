@@ -206,7 +206,7 @@ cat <<EOF > "$REFRESH_PLIST_PATH"
     <array>
         <string>/bin/sh</string>
         <string>-c</string>
-        <string>date; exec "${DIR}/refresh-models.sh" --port ${PORT}</string>
+        <string>date; "${DIR}/rotate-logs.sh"; exec "${DIR}/refresh-models.sh" --port ${PORT}</string>
     </array>
     <key>StartCalendarInterval</key>
     <dict>
