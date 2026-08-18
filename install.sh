@@ -136,13 +136,15 @@ EOF
 echo "[5/5] Registering launchd agent..."
 mkdir -p "$HOME/Library/LaunchAgents"
 
-# 기존 구 라벨 정리
+# 기존 구 라벨 및 refresh 라벨 정리
 UID_VAL="$(id -u)"
-if [ -f "$OLD_PLIST_PATH" ]; then
-    echo "  - Cleaning up legacy launchd agent ($OLD_PLIST_LABEL)..."
-    launchctl bootout "gui/$UID_VAL" "$OLD_PLIST_PATH" 2>/dev/null || launchctl unload "$OLD_PLIST_PATH" 2>/dev/null || true
-    rm -f "$OLD_PLIST_PATH"
-fi
+for old_path in "$OLD_PLIST_PATH" "$REFRESH_PLIST_PATH"; do
+    if [ -f "$old_path" ]; then
+        echo "  - Cleaning up legacy/unused launchd agent ($(basename "$old_path"))..."
+        launchctl bootout "gui/$UID_VAL" "$old_path" 2>/dev/null || launchctl unload "$old_path" 2>/dev/null || true
+        rm -f "$old_path"
+    fi
+done
 
 cat <<EOF > "$PLIST_PATH"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -190,58 +192,6 @@ else
     echo "  - Warning: Could not auto-register with launchctl."
 fi
 
-# Daily model refresh. The probe is what keeps the picker honest: Antigravity
-# adds and drops models without warning, and a stale cache looks exactly like a
-# broken proxy. launchd runs it at the next wake if the Mac was asleep at 10:00.
-# PATH is set explicitly because launchd agents get a bare one and the probe
-# shells out to `agy`.
-cat <<EOF > "$REFRESH_PLIST_PATH"
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>${REFRESH_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/sh</string>
-        <string>-c</string>
-        <string>date; "${DIR}/rotate-logs.sh"; exec "${DIR}/refresh-models.sh" --port ${PORT}</string>
-    </array>
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>10</integer>
-        <key>Minute</key>
-        <integer>0</integer>
-    </dict>
-    <key>WorkingDirectory</key>
-    <string>${DIR}</string>
-    <key>StandardOutPath</key>
-    <string>${DIR}/refresh.log</string>
-    <key>StandardErrorPath</key>
-    <string>${DIR}/refresh.log</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>${HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-    </dict>
-</dict>
-</plist>
-EOF
-
-echo "  - Created refresh plist at $REFRESH_PLIST_PATH"
-
-launchctl bootout "gui/$UID_VAL" "$REFRESH_PLIST_PATH" 2>/dev/null || launchctl unload "$REFRESH_PLIST_PATH" 2>/dev/null || true
-
-if launchctl bootstrap "gui/$UID_VAL" "$REFRESH_PLIST_PATH" 2>/dev/null; then
-    echo "  - Scheduled daily model refresh at 10:00."
-elif launchctl load -w "$REFRESH_PLIST_PATH" 2>/dev/null; then
-    echo "  - Scheduled daily model refresh at 10:00 (fallback)."
-else
-    echo "  - Warning: Could not schedule the daily model refresh."
-fi
-
 # 6. 검증
 echo ""
 echo "[*] Verifying proxy service status..."
@@ -264,17 +214,15 @@ echo ""
 echo "Next Steps:"
 echo "1. Aside App Usage:"
 echo "   Open Aside -> Settings -> AI -> Providers. 'Antigravity' is registered."
-echo "   Select Antigravity models directly in the model picker."
+echo "   Select Antigravity models (e.g. Gemini 3.7 Flash) directly in the model picker."
 echo ""
 echo "2. Aside CLI Usage:"
-echo "   aside exec --provider antigravity --model gemini-3.6-flash-high \"Reply with PONG\""
+echo "   aside exec --provider antigravity --model gemini-3.7-flash-high \"Reply with PONG\""
 echo ""
 echo "3. Model refresh:"
-echo "   Reprobes daily at 10:00 (launchd: ${REFRESH_LABEL})."
-echo "   Run ./refresh-models.sh yourself to reprobe right now."
+echo "   Models are dynamically resolved. Run ./refresh-models.sh if you want a manual sync."
 echo ""
 echo "4. Logs location:"
 echo "   - Output log:  ${DIR}/proxy.log"
 echo "   - Error log:   ${DIR}/proxy.err.log"
-echo "   - Refresh log: ${DIR}/refresh.log"
 echo ""

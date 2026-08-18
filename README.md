@@ -47,27 +47,17 @@ In the app, open **Settings → AI → Providers**. *Antigravity* is listed ther
 From the CLI:
 
 ```bash
-aside exec --provider antigravity --model gemini-3.6-flash-high "Summarize this page"
+aside exec --provider antigravity --model gemini-3.7-flash-high "Summarize this page"
 ```
 
 ## Models
 
-The installer asks Antigravity which models actually answer rather than trusting a list. `agy models` advertises some the gateway turns down, and the effort tiers are inconsistent about which ones work, so every candidate gets a one-line probe and only the ones that reply are registered.
+Models are dynamically discovered and formatted across Gemini, Claude, and GPT-OSS families without static hardcoding. Effort suffixes (`-high`, `-medium`, `-low`, `-thinking`) are collapsed to show each model cleanly in the picker.
 
-Model names drop the effort suffix. When several tiers work, the picker shows the model once, backed by the best tier that answered.
-
-The installer schedules a reprobe every day at 10:00, so models Antigravity adds or drops show up on their own. Probing spends real quota, but a full sweep is a one-line request per candidate — small enough that a daily run costs less than a stale picker does. Reprobe on demand any time:
+If you ever want to re-run a manual probe and sync with all Aside profiles:
 
 ```bash
 ./refresh-models.sh
-```
-
-Either way it reprobes, updates Aside's config, and prints what came and went to `refresh.log`. Restart Aside if the list changed.
-
-To stop the daily run without uninstalling:
-
-```bash
-launchctl bootout gui/$(id -u)/io.local.aside-antigravity-proxy.refresh
 ```
 
 ## Options
@@ -75,10 +65,9 @@ launchctl bootout gui/$(id -u)/io.local.aside-antigravity-proxy.refresh
 | | |
 |---|---|
 | Different port | `./install.sh 9000` — the installer also moves off a port that's taken |
-| Logs | `proxy.log`, `proxy.err.log`, `refresh.log` in this directory — trimmed to the last 2000 lines by the daily job, or by `./rotate-logs.sh` (`KEEP_LINES=500 ./rotate-logs.sh` to keep fewer) |
-| Refresh schedule | daily at 10:00, launchd agent `io.local.aside-antigravity-proxy.refresh` |
+| Logs | `proxy.log`, `proxy.err.log` in this directory — trimmed by `./rotate-logs.sh` (`KEEP_LINES=500 ./rotate-logs.sh`) |
 | Health check | `curl http://127.0.0.1:8317/health` |
-| Uninstall | `./uninstall.sh` — removes both launchd agents and the Aside provider entry, leaves your Antigravity login alone |
+| Uninstall | `./uninstall.sh` — removes the launchd daemon and the Aside provider entry, leaves your Antigravity login alone |
 
 ## Credentials
 

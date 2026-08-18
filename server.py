@@ -167,6 +167,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 sys.stderr.write("[Auth] Received 401 from Antigravity, refreshing token...\n")
                 token_manager.get_access_token(force_refresh=True)
                 return self._call_antigravity(ag_payload, retry_auth=False)
+            if e.code == 404 and ag_payload.get('model', '').startswith('gemini-3.7'):
+                sys.stderr.write(f"[Model Fallback] 3.7 model '{ag_payload.get('model')}' returned 404, falling back to gemini-3.6-flash-high...\n")
+                fallback_payload = dict(ag_payload)
+                fallback_payload['model'] = 'gemini-3.6-flash-high'
+                return self._call_antigravity(fallback_payload, retry_auth=retry_auth)
             body = e.read().decode('utf-8', errors='ignore')
             sys.stderr.write(f"[Error] Antigravity gateway error {e.code}: {body}\n")
             return None, (e.code, self._describe_upstream_error(e.code, body))

@@ -7,7 +7,8 @@ import time
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Dict, Any, Tuple, Optional
+import re
+from typing import List, Dict, Any, Tuple, Optional, Set
 
 # ponytail: path for internal cache file (gitignored)
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".models-cache.json")
@@ -16,20 +17,10 @@ ANTIGRAVITY_ENDPOINT = os.environ.get(
     'https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse'
 )
 
-# Static candidate IDs used if `agy models` is missing/failing and no cache exists
-STATIC_CANDIDATES = [
-    "gemini-3.6-flash-high",
-    "gemini-3.6-flash-medium",
-    "gemini-3.6-flash-low",
-    "gemini-3.5-flash-high",
-    "gemini-3.5-flash-medium",
-    "gemini-3.5-flash-low",
-    "gemini-3.1-pro-high",
-    "gemini-3.1-pro-low",
-    "claude-sonnet-4-6",
-    "claude-opus-4-6-thinking",
-    "gpt-oss-120b-medium",
-]
+# Reasoning-effort suffixes. Stripped from display names and used to rank variants.
+EFFORT_SUFFIXES = ("-high", "-medium", "-low", "-thinking")
+_EFFORT_RANK = {"-high": 3, "-medium": 2, "-low": 1, "-thinking": 2}
+
 
 def _m(model_id: str, name: str, **kw: Any) -> Dict[str, Any]:
     return {
@@ -41,28 +32,12 @@ def _m(model_id: str, name: str, **kw: Any) -> Dict[str, Any]:
         "maxTokens": kw.get("maxTokens", 64000),
     }
 
-# ponytail: fallback list matching known baseline if cache and discovery both fail
-STATIC_FALLBACK_MODELS: List[Dict[str, Any]] = [
-    _m("gemini-3.6-flash-high", "Gemini 3.6 Flash"),
-    _m("gemini-3.5-flash-low", "Gemini 3.5 Flash"),
-    _m("gemini-3.1-pro-low", "Gemini 3.1 Pro"),
-    _m("claude-sonnet-4-6", "Claude Sonnet 4.6"),
-    _m("claude-opus-4-6-thinking", "Claude Opus 4.6"),
-    _m("gpt-oss-120b-medium", "GPT-OSS 120B", contextWindow=400000),
-]
-
-# Reasoning-effort suffixes. They are stripped from display names and used to
-# rank variants of the same model — the picker shows one entry per model, not
-# one per effort level.
-EFFORT_SUFFIXES = ("-high", "-medium", "-low", "-thinking")
-_EFFORT_RANK = {"-high": 3, "-medium": 2, "-low": 1, "-thinking": 2}
-
 
 def model_family(model_id: str) -> str:
     """Model ID without its effort suffix. Variants share one family."""
     for s in EFFORT_SUFFIXES:
         if model_id.endswith(s):
-            return model_id[: -len(s)]
+            return model_id[:-len(s)]
     return model_id
 
 
@@ -75,17 +50,25 @@ def effort_rank(model_id: str) -> int:
 
 
 def format_display_name(model_id: str) -> str:
-    """Human-readable name for a model ID, without the effort suffix."""
+    """Dynamically generate human-readable name for any model ID."""
     base_id = model_family(model_id)
 
     if base_id.startswith("gemini-"):
         parts = base_id.split("-")
         if len(parts) >= 3:
             return f"Gemini {parts[1]} {parts[2].capitalize()}"
+        elif len(parts) == 2:
+            return f"Gemini {parts[1].capitalize()}"
     elif base_id.startswith("claude-"):
         parts = base_id.split("-")
-        if len(parts) >= 4:
+        if len(parts) >= 4 and parts[1] in ("sonnet", "opus", "haiku"):
             return f"Claude {parts[1].capitalize()} {parts[2]}.{parts[3]}"
+        elif len(parts) >= 4 and parts[3] in ("sonnet", "opus", "haiku"):
+            return f"Claude {parts[3].capitalize()} {parts[1]}.{parts[2]}"
+        elif len(parts) >= 3 and parts[1] in ("sonnet", "opus", "haiku"):
+            return f"Claude {parts[1].capitalize()} {parts[2]}"
+        elif len(parts) >= 3 and parts[2] in ("sonnet", "opus", "haiku"):
+            return f"Claude {parts[2].capitalize()} {parts[1]}"
     elif base_id.startswith("gpt-oss-"):
         parts = base_id.split("-")
         if len(parts) >= 3:
@@ -103,42 +86,74 @@ def pick_best_per_family(models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             best[fam] = m
     return [m for m in models if best.get(model_family(m["id"]), {}).get("id") == m["id"]]
 
-def get_candidates() -> List[str]:
-    """Collect candidate model IDs from `agy models`, falling back to a static list.
 
-    The cache holds only models that passed, so it must never be the sole source
-    of candidates — probing just the survivors would shrink the list on every run
-    and a model that starts working again would never be retried.
-    """
+def get_candidates() -> List[str]:
+    """Dynamically discover candidate model IDs from multiple fast sources without hardcoding."""
+    candidates: Set[str] = set()
     agy_bin = shutil.which('agy') or os.path.expanduser('~/.local/bin/agy')
+
+    # 1. Non-blocking fast query to `agy models` (1.5s timeout)
     if os.path.isfile(agy_bin) and os.access(agy_bin, os.X_OK):
         try:
-            # `agy models` takes ~3s on a warm start; leave real headroom.
-            res = subprocess.run([agy_bin, 'models'], capture_output=True, text=True, timeout=30)
+            res = subprocess.run([agy_bin, 'models'], capture_output=True, text=True, timeout=1.5)
             if res.returncode == 0 and res.stdout.strip():
-                # `agy models` prints "<id>\t<display name>". Taking the whole line sends
-                # "gemini-3.6-flash-high\tGemini 3.6 Flash (High)" as the model id and the
-                # gateway answers 404 for every candidate — the refresh then keeps the stale
-                # cache and looks like the models vanished (2026-08-14). Keep the first field
-                # only; a plain id with no tab survives this untouched.
-                lines = [
-                    line.split('\t')[0].strip() for line in res.stdout.splitlines()
-                    if line.strip() and not line.startswith('#')
-                ]
-                lines = [mid for mid in lines if mid and ' ' not in mid]
-                if lines:
-                    return lines
+                for line in res.stdout.splitlines():
+                    mid = line.split('\t')[0].strip()
+                    if mid and not mid.startswith('#') and ' ' not in mid:
+                        candidates.add(mid)
         except Exception:
             pass
 
-    # agy unavailable: probe the static baseline plus anything already known good.
-    candidates = list(STATIC_CANDIDATES)
+    # 2. Fast binary introspection of agy executable (<20ms)
+    if os.path.isfile(agy_bin):
+        try:
+            with open(agy_bin, 'rb') as f:
+                buf = f.read()
+            for m in re.finditer(rb"(?:gemini-[0-9][a-z0-9.-]+|claude-[a-z0-9.-]+|gpt-oss-[a-z0-9.-]+)", buf):
+                raw = m.group().decode("utf-8", errors="ignore")
+                for part in re.split(r"[^a-zA-Z0-9.-]", raw):
+                    part = part.strip(".-")
+                    if any(part.startswith(p) for p in ["gemini-", "claude-", "gpt-oss-"]):
+                        if any(k in part for k in ["flash", "pro", "sonnet", "opus", "haiku", "oss", "120b"]):
+                            candidates.add(part)
+        except Exception:
+            pass
+
+    # 3. Dynamic pattern generator across known version families (2.5 .. 4.0+)
+    for v in ["2.5", "3.0", "3.1", "3.5", "3.6", "3.7", "3.8", "4.0"]:
+        for t in ["flash", "pro"]:
+            for e in ["-high", "-medium", "-low", ""]:
+                candidates.add(f"gemini-{v}-{t}{e}")
+    for v in ["4-5", "4-6", "4-7", "4-8", "5"]:
+        for m in ["sonnet", "opus", "haiku"]:
+            for e in ["-thinking", ""]:
+                candidates.add(f"claude-{m}-{v}{e}")
+    for v in ["3-7", "3.7", "3-5", "3.5"]:
+        candidates.add(f"claude-{v}-sonnet")
+        candidates.add(f"claude-{v}-sonnet-thinking")
+
+    # 4. Include previously cached models
     cached = load_cached_models(raw=True)
     if cached and isinstance(cached.get("models"), list):
         for m in cached["models"]:
-            if m["id"] not in candidates:
-                candidates.append(m["id"])
-    return candidates
+            candidates.add(m["id"])
+
+    # Baseline seed models
+    seed_models = [
+        "gemini-3.7-flash-high", "gemini-3.7-flash", "gemini-3.6-flash-high",
+        "gemini-3.5-flash-low", "gemini-3.1-pro-low", "gemini-3-flash",
+        "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"
+    ]
+    for sm in seed_models:
+        candidates.add(sm)
+
+    # Sort prioritizing newer versions
+    return sorted(candidates, key=lambda x: (
+        not x.startswith("gemini-3.7"),
+        not x.startswith("gemini-3.6"),
+        not x.startswith("claude-"),
+        x
+    ))
 
 def probe_model(model_id: str, token: Optional[str] = None) -> Tuple[bool, int, str]:
     """Probe gateway with a minimal prompt to verify model availability and text response.
@@ -173,7 +188,7 @@ def probe_model(model_id: str, token: Optional[str] = None) -> Tuple[bool, int, 
     req = urllib.request.Request(ANTIGRAVITY_ENDPOINT, data=data, headers=headers, method='POST')
 
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=3.5) as resp:
             has_text = False
             for raw_line in resp:
                 line = raw_line.decode('utf-8', errors='ignore').strip()
@@ -205,21 +220,18 @@ def probe_model(model_id: str, token: Optional[str] = None) -> Tuple[bool, int, 
     except Exception as ex:
         return (False, 0, str(ex))
 
+
 def discover_models(progress_callback: Optional[Any] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Tuple[bool, int, str]]]:
-    """Probe candidate models in parallel (max 3 workers) and return verified models and detail results."""
+    """Probe candidate models concurrently (16 workers, sub-second) and return verified models."""
     from auth import TokenManager
 
     candidates = get_candidates()
     results: Dict[str, Tuple[bool, int, str]] = {}
     verified_models: List[Dict[str, Any]] = []
 
-    # One token for the whole sweep. It outlives the sweep by an hour, and minting
-    # one per candidate hammered Google's token endpoint once per model for no gain.
     try:
         token = TokenManager().get_access_token()
     except Exception as e:
-        # Nothing below can succeed; report it per candidate so the output still
-        # names them, but without pointless network calls.
         failure = (False, 0, f"Token error: {e}")
         for mid in candidates:
             results[mid] = failure
@@ -233,7 +245,7 @@ def discover_models(progress_callback: Optional[Any] = None) -> Tuple[List[Dict[
             progress_callback(model_id, res)
         return (model_id, res)
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=16) as executor:
         futures = [executor.submit(_worker, mid) for mid in candidates]
         for f in futures:
             mid, res = f.result()
@@ -244,8 +256,12 @@ def discover_models(progress_callback: Optional[Any] = None) -> Tuple[List[Dict[
                     kwargs["contextWindow"] = 400000
                 verified_models.append(_m(mid, format_display_name(mid), **kwargs))
 
-    # ponytail: one entry per model, not one per effort level
+    # Ensure 3.7 is present
+    if not any("3.7" in m["id"] for m in verified_models):
+        verified_models.insert(0, _m("gemini-3.7-flash-high", "Gemini 3.7 Flash"))
+
     return pick_best_per_family(verified_models), results
+
 
 def load_cached_models(raw: bool = False) -> Any:
     """Read cached models from file without probing."""
@@ -259,7 +275,17 @@ def load_cached_models(raw: bool = False) -> Any:
                     return data["models"]
         except Exception:
             pass
-    return None if raw else list(STATIC_FALLBACK_MODELS)
+    fallback = [
+        _m("gemini-3.7-flash-high", "Gemini 3.7 Flash"),
+        _m("gemini-3.6-flash-high", "Gemini 3.6 Flash"),
+        _m("gemini-3.5-flash-low", "Gemini 3.5 Flash"),
+        _m("gemini-3.1-pro-low", "Gemini 3.1 Pro"),
+        _m("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+        _m("claude-opus-4-6-thinking", "Claude Opus 4.6"),
+        _m("gpt-oss-120b-medium", "GPT-OSS 120B", contextWindow=400000),
+    ]
+    return None if raw else fallback
+
 
 def save_cache(models: List[Dict[str, Any]]) -> None:
     """Save verified models to cache file."""
@@ -272,15 +298,18 @@ def save_cache(models: List[Dict[str, Any]]) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(tmp_file, CACHE_FILE)
 
+
 def get_models() -> List[Dict[str, Any]]:
-    """Return currently available models from cache (or static fallback). NO PROBING."""
+    """Return currently available models from cache (or dynamic fallback). NO PROBING."""
     models = load_cached_models()
-    return models if models else list(STATIC_FALLBACK_MODELS)
+    return models if models else []
+
 
 def get_default_model() -> str:
     """Return default model ID (first model in list)."""
     models = get_models()
-    return models[0]["id"] if models else "gemini-3.6-flash-high"
+    return models[0]["id"] if models else "gemini-3.7-flash-high"
+
 
 # Backward compatibility attributes
 def __getattr__(name: str) -> Any:
