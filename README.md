@@ -56,22 +56,29 @@ The installer asks Antigravity which models actually answer rather than trusting
 
 Model names drop the effort suffix. When several tiers work, the picker shows the model once, backed by the best tier that answered.
 
-The list is cached and never refreshes on its own, because probing spends real quota. Refresh it yourself when Antigravity changes something:
+The installer schedules a reprobe every day at 10:00, so models Antigravity adds or drops show up on their own. Probing spends real quota, but a full sweep is a one-line request per candidate — small enough that a daily run costs less than a stale picker does. Reprobe on demand any time:
 
 ```bash
 ./refresh-models.sh
 ```
 
-It reprobes, updates Aside's config, and prints what came and went.
+Either way it reprobes, updates Aside's config, and prints what came and went to `refresh.log`. Restart Aside if the list changed.
+
+To stop the daily run without uninstalling:
+
+```bash
+launchctl bootout gui/$(id -u)/io.local.aside-antigravity-proxy.refresh
+```
 
 ## Options
 
 | | |
 |---|---|
 | Different port | `./install.sh 9000` — the installer also moves off a port that's taken |
-| Logs | `proxy.log`, `proxy.err.log` in this directory |
+| Logs | `proxy.log`, `proxy.err.log`, `refresh.log` in this directory |
+| Refresh schedule | daily at 10:00, launchd agent `io.local.aside-antigravity-proxy.refresh` |
 | Health check | `curl http://127.0.0.1:8317/health` |
-| Uninstall | `./uninstall.sh` — removes the launchd agent and the Aside provider entry, leaves your Antigravity login alone |
+| Uninstall | `./uninstall.sh` — removes both launchd agents and the Aside provider entry, leaves your Antigravity login alone |
 
 ## Credentials
 

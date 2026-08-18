@@ -8,12 +8,15 @@ PLIST_LABEL="io.local.aside-antigravity-proxy"
 OLD_PLIST_LABEL="com.does.aside-antigravity-proxy"
 PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
 OLD_PLIST_PATH="$HOME/Library/LaunchAgents/${OLD_PLIST_LABEL}.plist"
+REFRESH_PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.refresh.plist"
 
 echo "=== Aside Antigravity Proxy Uninstaller ==="
 
 UID_VAL="$(id -u)"
-echo "[1/4] Unregistering launchd agent..."
-for ppath in "$PLIST_PATH" "$OLD_PLIST_PATH"; do
+echo "[1/4] Unregistering launchd agents..."
+# The refresh agent has to go too. Left behind it wakes every morning to probe
+# for a proxy that isn't there and writes the failure to a log nobody reads.
+for ppath in "$PLIST_PATH" "$OLD_PLIST_PATH" "$REFRESH_PLIST_PATH"; do
     if [ -f "$ppath" ]; then
         launchctl bootout "gui/$UID_VAL" "$ppath" 2>/dev/null || launchctl unload "$ppath" 2>/dev/null || true
         rm -f "$ppath"
