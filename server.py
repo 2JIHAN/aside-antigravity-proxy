@@ -8,7 +8,14 @@ from socketserver import ThreadingMixIn
 from typing import Dict, Any
 
 from auth import TokenManager
-from models import get_models, get_default_model
+from models import (
+    get_models,
+    get_default_model,
+    is_cache_stale,
+    refresh_models_background,
+    invalidate_model,
+    get_fallback_model,
+)
 from translator import anthropic_to_antigravity, process_antigravity_stream
 
 def _read_version() -> str:
@@ -49,6 +56,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        # Lazy background refresh check on GET endpoints (/health, /models)
+        port = getattr(self.server, 'server_address', ('', DEFAULT_PORT))[1]
+        if is_cache_stale(3600):
+            refresh_models_background(port=str(port))
+
         if self.path in ('/health', '/'):
             self.send_response(200)
             self._send_cors_headers()
@@ -88,6 +100,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def handle_messages(self):
+        port = getattr(self.server, 'server_address', ('', DEFAULT_PORT))[1]
+        if is_cache_stale(3600):
+            refresh_models_background(port=str(port))
+
         content_length = int(self.headers.get('Content-Length', 0))
         body_bytes = self.rfile.read(content_length)
 
@@ -167,11 +183,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 sys.stderr.write("[Auth] Received 401 from Antigravity, refreshing token...\n")
                 token_manager.get_access_token(force_refresh=True)
                 return self._call_antigravity(ag_payload, retry_auth=False)
-            if e.code == 404 and ag_payload.get('model', '').startswith('gemini-3.7'):
-                sys.stderr.write(f"[Model Fallback] 3.7 model '{ag_payload.get('model')}' returned 404, falling back to gemini-3.6-flash-high...\n")
-                fallback_payload = dict(ag_payload)
-                fallback_payload['model'] = 'gemini-3.6-flash-high'
-                return self._call_antigravity(fallback_payload, retry_auth=retry_auth)
+            if e.code == 404:
+                failed_model = ag_payload.get('model', '')
+                fallback_model = get_fallback_model(failed_model)
+                if fallback_model and fallback_model != failed_model:
+                    sys.stderr.write(f"[Self-Healing] Model '{failed_model}' returned 404, invalidating and falling back to '{fallback_model}'...\n")
+                    port = getattr(self.server, 'server_address', ('', DEFAULT_PORT))[1]
+                    invalidate_model(failed_model, port=str(port))
+                    fallback_payload = dict(ag_payload)
+                    fallback_payload['model'] = fallback_model
+                    return self._call_antigravity(fallback_payload, retry_auth=retry_auth)
             body = e.read().decode('utf-8', errors='ignore')
             sys.stderr.write(f"[Error] Antigravity gateway error {e.code}: {body}\n")
             return None, (e.code, self._describe_upstream_error(e.code, body))
@@ -213,6 +234,10 @@ def run_server(port: int = DEFAULT_PORT):
         # ponytail: exit gracefully with code 0 so launchd (SuccessfulExit=false) stops looping
         sys.stderr.write(f"[Fatal] Failed to bind to 127.0.0.1:{port}: {e}\nExiting gracefully to prevent restart loop.\n")
         sys.exit(0)
+
+    # Lazy refresh on boot if cache is stale (>30 minutes)
+    if is_cache_stale(1800):
+        refresh_models_background(port=str(port))
 
     print(f"[*] Aside Antigravity Proxy Server running on http://127.0.0.1:{port}")
     try:

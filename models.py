@@ -7,6 +7,7 @@ import time
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
+import threading
 import re
 from typing import List, Dict, Any, Tuple, Optional, Set
 
@@ -87,6 +88,43 @@ def pick_best_per_family(models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [m for m in models if best.get(model_family(m["id"]), {}).get("id") == m["id"]]
 
 
+def model_sort_key(m: Dict[str, Any]) -> Tuple[int, float, int, str]:
+    """Sort models intelligently:
+    1. Gemini Flash (highest version first)
+    2. Gemini Pro (highest version first)
+    3. Claude Sonnet/Opus
+    4. GPT-OSS
+    5. Other
+    """
+    mid = m["id"].lower()
+    if "gemini" in mid and "flash" in mid:
+        tier = 1
+    elif "gemini" in mid and "pro" in mid:
+        tier = 2
+    elif "claude" in mid and "sonnet" in mid:
+        tier = 3
+    elif "claude" in mid and "opus" in mid:
+        tier = 4
+    elif "claude" in mid:
+        tier = 5
+    elif "gpt-oss" in mid:
+        tier = 6
+    else:
+        tier = 7
+
+    version = 0.0
+    v_match = re.search(r'(\d+)(?:[.-](\d+))?', mid)
+    if v_match:
+        major = v_match.group(1)
+        minor = v_match.group(2) or "0"
+        try:
+            version = float(f"{major}.{minor}")
+        except ValueError:
+            version = float(major)
+
+    return (tier, -version, -effort_rank(mid), mid)
+
+
 def get_candidates() -> List[str]:
     """Dynamically discover candidate model IDs from multiple fast sources without hardcoding."""
     candidates: Set[str] = set()
@@ -140,8 +178,9 @@ def get_candidates() -> List[str]:
 
     # Baseline seed models
     seed_models = [
-        "gemini-3.7-flash-high", "gemini-3.7-flash", "gemini-3.6-flash-high",
-        "gemini-3.5-flash-low", "gemini-3.1-pro-low", "gemini-3-flash",
+        "gemini-3.8-flash-high", "gemini-3.8-flash",
+        "gemini-3.6-flash-high", "gemini-3.5-flash-low",
+        "gemini-3.1-pro-low", "gemini-3-flash",
         "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"
     ]
     for sm in seed_models:
@@ -149,8 +188,9 @@ def get_candidates() -> List[str]:
 
     # Sort prioritizing newer versions
     return sorted(candidates, key=lambda x: (
-        not x.startswith("gemini-3.7"),
+        not x.startswith("gemini-3.8"),
         not x.startswith("gemini-3.6"),
+        not x.startswith("gemini-3.7"),
         not x.startswith("claude-"),
         x
     ))
@@ -256,11 +296,9 @@ def discover_models(progress_callback: Optional[Any] = None) -> Tuple[List[Dict[
                     kwargs["contextWindow"] = 400000
                 verified_models.append(_m(mid, format_display_name(mid), **kwargs))
 
-    # Ensure 3.7 is present
-    if not any("3.7" in m["id"] for m in verified_models):
-        verified_models.insert(0, _m("gemini-3.7-flash-high", "Gemini 3.7 Flash"))
-
-    return pick_best_per_family(verified_models), results
+    best_models = pick_best_per_family(verified_models)
+    best_models.sort(key=model_sort_key)
+    return best_models, results
 
 
 def load_cached_models(raw: bool = False) -> Any:
@@ -276,7 +314,7 @@ def load_cached_models(raw: bool = False) -> Any:
         except Exception:
             pass
     fallback = [
-        _m("gemini-3.7-flash-high", "Gemini 3.7 Flash"),
+        _m("gemini-3.8-flash-high", "Gemini 3.8 Flash"),
         _m("gemini-3.6-flash-high", "Gemini 3.6 Flash"),
         _m("gemini-3.5-flash-low", "Gemini 3.5 Flash"),
         _m("gemini-3.1-pro-low", "Gemini 3.1 Pro"),
@@ -308,7 +346,91 @@ def get_models() -> List[Dict[str, Any]]:
 def get_default_model() -> str:
     """Return default model ID (first model in list)."""
     models = get_models()
-    return models[0]["id"] if models else "gemini-3.7-flash-high"
+    return models[0]["id"] if models else "gemini-3.8-flash-high"
+
+
+_refresh_lock = threading.Lock()
+_is_refreshing = False
+
+
+def is_cache_stale(ttl_seconds: int = 3600) -> bool:
+    """Check if the models cache is older than ttl_seconds or missing/empty."""
+    if not os.path.isfile(CACHE_FILE):
+        return True
+    try:
+        with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            fetched_at = data.get("fetched_at", 0)
+            models = data.get("models", [])
+            if not models:
+                return True
+            return (time.time() - fetched_at) > ttl_seconds
+    except Exception:
+        return True
+
+
+def refresh_models_background(port: str = "8317", on_complete: Optional[Any] = None) -> bool:
+    """Trigger a non-blocking background model probe and config update."""
+    global _is_refreshing
+    with _refresh_lock:
+        if _is_refreshing:
+            return False
+        _is_refreshing = True
+
+    def _run():
+        global _is_refreshing
+        try:
+            from refresh_models import run_refresh
+            run_refresh(port=str(port), quiet=True)
+        except Exception as ex:
+            sys.stderr.write(f"[AutoRefresh] Background model refresh failed: {ex}\n")
+        finally:
+            with _refresh_lock:
+                _is_refreshing = False
+            if on_complete:
+                try:
+                    on_complete()
+                except Exception:
+                    pass
+
+    t = threading.Thread(target=_run, name="aside-model-refresh", daemon=True)
+    t.start()
+    return True
+
+
+def invalidate_model(model_id: str, port: str = "8317") -> None:
+    """Remove an invalid/dead model from cache and trigger async reprobe."""
+    try:
+        cached = load_cached_models(raw=True)
+        if cached and isinstance(cached.get("models"), list):
+            new_models = [m for m in cached["models"] if m["id"] != model_id and model_family(m["id"]) != model_family(model_id)]
+            if len(new_models) != len(cached["models"]):
+                save_cache(new_models)
+                from refresh_models import update_aside_models_json
+                update_aside_models_json(new_models, port=str(port))
+    except Exception as ex:
+        sys.stderr.write(f"[Invalidate] Failed to update cache for {model_id}: {ex}\n")
+    refresh_models_background(port=str(port))
+
+
+def get_fallback_model(failed_model_id: str) -> Optional[str]:
+    """Find the best alternative working model when failed_model_id errors with 404."""
+    models = get_models()
+    if not models:
+        return None
+
+    # 1. Try finding another model in the same broad family (e.g. gemini -> newest gemini)
+    fam_prefix = failed_model_id.split("-")[0] if "-" in failed_model_id else ""
+    if fam_prefix:
+        for m in models:
+            if m["id"] != failed_model_id and m["id"].startswith(fam_prefix):
+                return m["id"]
+
+    # 2. Otherwise return the default model
+    for m in models:
+        if m["id"] != failed_model_id:
+            return m["id"]
+    return None
 
 
 # Backward compatibility attributes
